@@ -33,6 +33,20 @@ pip install -e .
 
 ## Quick Start
 
+### Option 1: Integrated Training Script (Recommended)
+```bash
+# Run the complete training pipeline with automatic assessment
+bash Train_sae_script.sh
+```
+
+This script includes:
+- ✅ Complete training configuration
+- ✅ Automatic WandB logging
+- ✅ Post-training health assessment
+- ✅ SAEBench metric evaluation
+- ✅ Final results summary
+
+### Option 2: Manual Training
 ```bash
 # Train an SAE on BERT layer 6
 python -m saetrain bert-base-uncased jyanimaulik/yahoo_finance_stockmarket_news \
@@ -80,9 +94,45 @@ python -m saetrain bert-base-uncased jyanimaulik/yahoo_finance_stockmarket_news 
 | `--layer_stride` | int | 1 | Stride between layers |
 | `--dead_feature_threshold` | int | 10000000 | Old dead feature threshold (deprecated) |
 
-## Examples
+## Integrated Training Script
 
-### Basic Training
+The `Train_sae_script.sh` provides a complete training pipeline with automatic assessment:
+
+### Features
+- **Complete Configuration**: Pre-configured for BERT layer 6 training
+- **Large Dataset**: Uses 500M tokens for robust training
+- **Optimized Parameters**: Balanced expansion factor (8) and sparsity (k=192)
+- **Automatic Assessment**: Post-training health evaluation using SAEBench standards
+- **WandB Integration**: Real-time metric monitoring
+- **Error Handling**: Robust run ID extraction and validation
+
+### Configuration Details
+```bash
+Model: bert-base-uncased
+Layer: 6
+Max Tokens: 500,000,000 (500M)
+Batch Size: 4
+TopK: 192
+Expansion Factor: 8
+Context Length: 512
+Learning Rate: 0.001
+Dead Feature Threshold: 0.05%
+```
+
+### Output
+After training, the script automatically:
+1. Extracts final metrics from WandB
+2. Evaluates against SAEBench thresholds
+3. Provides health assessment (4/4 metrics)
+4. Saves detailed results to `final_assessment.json`
+
+### Health Metrics Evaluated
+- **Loss Recovered**: ≥60-70% (reconstruction quality)
+- **L0 Sparsity**: 20-200 range (feature utilization)
+- **Dead Features**: ≤10-20% (feature efficiency)
+- **Feature Absorption**: ≤0.25 (feature diversity)
+
+## Examples
 ```bash
 python -m saetrain bert-base-uncased wikitext \
     --layers 6 \

@@ -6,7 +6,6 @@ from glob import glob
 from typing import Sized
 import torch.nn.functional as F
 import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
 
 import torch
 import torch.distributed as dist
@@ -679,36 +678,44 @@ class Trainer:
     
     def calculate_feature_absorption(self, name: str) -> float:
         """
-        Calculate Feature Absorption following SAEBench methodology
-        Uses cosine similarity between decoder weights
+        Calculate Feature Absorption proxy using off-diag covariance norm (fast & stable)
+        Z = (z - mean)/std, C = (Zᵀ Z)/(N-1), proxy = mean(((C - diag(C))²)
         """
+        if name not in self.stored_inputs:
+            return 0.0
+            
+        # Get the stored activations for this SAE
+        inputs = self.stored_inputs[name]  # (batch_size, seq_len, d_in)
+        
         # Get the SAE
         sae = self.saes[name]
-        W_dec = sae.W_dec  # (d_sae, d_in)
         
-        # For large SAEs, sample a subset of features to avoid memory issues
-        d_sae = W_dec.shape[0]
-        if d_sae > 10000:  # If more than 10k features, sample 10k
-            sample_size = 10000
-            indices = torch.randperm(d_sae, device=W_dec.device)[:sample_size]
-            W_dec = W_dec[indices]
-        
-        # Convert to numpy for sklearn cosine_similarity
-        decoder_weights = W_dec.detach().cpu().numpy()  # (d_sae, d_in)
-        
-        # Calculate cosine similarities between all pairs of features
-        similarities = cosine_similarity(decoder_weights)
-        
-        # Remove diagonal (self-similarity = 1.0)
-        np.fill_diagonal(similarities, 0)
-        
-        # Calculate absorption as mean of top similarities
-        # Following SAEBench: take top k similarities where k = min(100, similarities.shape[0])
-        k = min(100, similarities.shape[0])
-        top_similarities = np.partition(similarities.flatten(), -k)[-k:]
-        absorption = np.mean(top_similarities)
-        
-        return float(absorption)
+        with torch.no_grad():
+            # Convert inputs to the same dtype as SAE weights
+            inputs = inputs.to(dtype=sae.encoder.weight.dtype)
+            
+            # Get pre-activations and apply ReLU
+            pre_acts = F.linear(inputs, sae.encoder.weight, sae.encoder.bias)
+            acts = F.relu(pre_acts)  # (batch_size, seq_len, d_sae)
+            
+            # Flatten to (N, d_sae) where N = batch_size * seq_len
+            acts_flat = acts.reshape(-1, acts.shape[-1])  # (N, d_sae)
+            
+            # Standardize activations: Z = (z - mean)/std
+            mean_acts = acts_flat.mean(dim=0, keepdim=True)  # (1, d_sae)
+            std_acts = acts_flat.std(dim=0, keepdim=True, unbiased=True)  # (1, d_sae)
+            std_acts = torch.clamp(std_acts, min=1e-8)  # Avoid division by zero
+            Z = (acts_flat - mean_acts) / std_acts  # (N, d_sae)
+            
+            # Compute covariance matrix: C = (Zᵀ Z)/(N-1)
+            N = Z.shape[0]
+            C = torch.mm(Z.T, Z) / (N - 1)  # (d_sae, d_sae)
+            
+            # Remove diagonal and compute mean squared off-diagonal elements
+            off_diag = C - torch.diag(torch.diag(C))  # Zero out diagonal
+            absorption_proxy = torch.mean(off_diag ** 2).item()
+            
+            return float(absorption_proxy)
 
     def local_hookpoints(self) -> list[str]:
         return (
