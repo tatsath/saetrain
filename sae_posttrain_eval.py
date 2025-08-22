@@ -60,6 +60,12 @@ def parse_arguments():
     parser.add_argument("--verbose", action="store_true",
                        help="Enable verbose output")
     
+    # Dead feature detection configuration
+    parser.add_argument("--min_activations", type=int, default=5,
+                       help="Minimum number of activations for a feature to be considered 'alive'")
+    parser.add_argument("--activation_threshold", type=float, default=0.1,
+                       help="Minimum average activation strength for a feature to be considered 'alive'")
+    
     return parser.parse_args()
 
 def setup_device(device_arg: str) -> torch.device:
@@ -518,10 +524,11 @@ def calculate_l0_sparsity_saebench(activations: torch.Tensor, weights: Dict) -> 
     # Return average L0 sparsity
     return active_features.mean().item()
 
-def calculate_dead_features_saebench(activations: torch.Tensor, weights: Dict, verbose: bool = False) -> float:
+def calculate_dead_features_saebench(activations: torch.Tensor, weights: Dict, verbose: bool = False, 
+                                   min_activations: int = 5, activation_threshold: float = 0.1) -> float:
     """
-    Calculate dead features following SAEBench methodology
-    Features that are never activated across the dataset
+    Calculate dead features following improved methodology
+    Features that are rarely activated (less than min_activations times) or have very low activation strength
     """
     # Encode to get activations
     _, _, pre_acts = encode_sae(activations, weights)
@@ -536,22 +543,35 @@ def calculate_dead_features_saebench(activations: torch.Tensor, weights: Dict, v
     # Count how many times each feature is activated
     feature_activations = (acts > 0).sum(dim=0)  # (d_sae,)
     
+    # Calculate average activation strength per feature
+    feature_strength = acts.sum(dim=0) / (acts > 0).sum(dim=0).clamp(min=1)  # (d_sae,)
+    
     if verbose:
         print(f"🔍 Dead Features Debug - Feature activations shape: {feature_activations.shape}")
         print(f"🔍 Dead Features Debug - Feature activations range: [{feature_activations.min():.0f}, {feature_activations.max():.0f}]")
         print(f"🔍 Dead Features Debug - Features with 0 activations: {(feature_activations == 0).sum().item()}")
-        print(f"🔍 Dead Features Debug - Features with >0 activations: {(feature_activations > 0).sum().item()}")
+        print(f"🔍 Dead Features Debug - Features with 1-4 activations: {((feature_activations > 0) & (feature_activations < min_activations)).sum().item()}")
+        print(f"🔍 Dead Features Debug - Features with >=5 activations: {(feature_activations >= min_activations).sum().item()}")
+        print(f"🔍 Dead Features Debug - Feature strength range: [{feature_strength.min():.4f}, {feature_strength.max():.4f}]")
     
-    # A feature is "dead" if it's never activated
-    dead_features = (feature_activations == 0).sum()
+    # A feature is "dead" if:
+    # 1. It's never activated (0 times), OR
+    # 2. It's activated less than min_activations times, OR  
+    # 3. It has very low average activation strength
+    dead_features = (
+        (feature_activations == 0) |  # Never activated
+        (feature_activations < min_activations) |  # Rarely activated
+        (feature_strength < activation_threshold)  # Weak activations
+    ).sum()
+    
     total_features = acts.shape[1]
-    
     dead_percentage = (dead_features / total_features) * 100
     
     if verbose:
-        print(f"🔍 Dead Features Debug - Dead features: {dead_features.item()}")
+        print(f"🔍 Dead Features Debug - Dead features (improved): {dead_features.item()}")
         print(f"🔍 Dead Features Debug - Total features: {total_features}")
         print(f"🔍 Dead Features Debug - Dead percentage: {dead_percentage:.4f}%")
+        print(f"🔍 Dead Features Debug - Criteria: 0 activations OR <{min_activations} activations OR strength<{activation_threshold}")
     
     return dead_percentage.item()
 
@@ -591,7 +611,8 @@ def evaluate_sae_health_real_activations(sae_path: str, model_name: str, layer: 
                                        dataset_name: str, dataset_column: str,
                                        num_samples: int, context_length: int,
                                        batch_size: int, device: torch.device,
-                                       verbose: bool = False) -> Tuple[Dict[str, float], Dict[str, Any]]:
+                                       verbose: bool = False, min_activations: int = 5,
+                                       activation_threshold: float = 0.1) -> Tuple[Dict[str, float], Dict[str, Any]]:
     """Evaluate SAE health using real model activations"""
     
     print(f"🔍 Evaluating SAE with real model activations")
@@ -630,7 +651,11 @@ def evaluate_sae_health_real_activations(sae_path: str, model_name: str, layer: 
     l0_sparsity = calculate_l0_sparsity_saebench(activations, weights)
     
     # 3. Dead Features %
-    dead_features = calculate_dead_features_saebench(activations, weights, verbose)
+    dead_features = calculate_dead_features_saebench(
+        activations, weights, verbose, 
+        min_activations=min_activations, 
+        activation_threshold=activation_threshold
+    )
     
     # 4. Feature Absorption
     absorption = calculate_feature_absorption_saebench(weights)
@@ -728,7 +753,9 @@ def main():
             context_length=args.context_length,
             batch_size=args.batch_size,
             device=device,
-            verbose=args.verbose
+            verbose=args.verbose,
+            min_activations=args.min_activations,
+            activation_threshold=args.activation_threshold
         )
         
         # Print results

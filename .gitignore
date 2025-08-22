@@ -113,6 +113,9 @@ saetrain.egg-info/
 test_*.py
 *_test.py
 run_*.sh
+!run_bert_layer6_separate_tracker.sh
+debug_activation_counts.py
+archive/
 
 # Model checkpoints and outputs
 checkpoints/

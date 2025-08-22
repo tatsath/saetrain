@@ -4,6 +4,9 @@ from dataclasses import asdict
 from fnmatch import fnmatchcase
 from glob import glob
 from typing import Sized
+import torch.nn.functional as F
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
 
 import torch
 import torch.distributed as dist
@@ -61,6 +64,15 @@ class Trainer:
         self.cfg = cfg
         self.dataset = dataset
         self.distribute_modules()
+        
+        # Initialize dead feature percentage tracking
+        self.feature_activation_counts = {}
+        self.total_tokens_processed = 0
+        self.activation_threshold = 1e-3  # τ ≈ 1e-3 (fixed)
+        self.dead_percentage_threshold = getattr(cfg, 'dead_percentage_threshold', 0.0005)  # 0.05%
+        
+        # Store inputs for L0 sparsity calculation
+        self.stored_inputs = {}
 
         device = model.device
         input_widths = resolve_widths(model, cfg.hookpoints)
@@ -85,6 +97,10 @@ class Trainer:
                 self.saes[name] = SparseCoder(
                     input_widths[hook], cfg.sae, device, dtype=torch.float32
                 )
+                
+                # Initialize dead feature percentage tracking for this SAE
+                d_sae = self.saes[name].num_latents
+                self.feature_activation_counts[name] = torch.zeros(d_sae, device=device)
 
         assert isinstance(dataset, Sized)
         num_batches = len(dataset) // cfg.batch_size
@@ -404,6 +420,25 @@ class Trainer:
             # Update the did_fire mask
             did_fire[name][out.latent_indices.flatten()] = True
             self.maybe_all_reduce(did_fire[name], "max")  # max is boolean "any"
+            
+            # Update dead feature percentage tracking
+            batch_size, k = out.latent_indices.shape
+            
+            # Get the full activation tensor for this batch
+            with torch.no_grad():
+                # Get pre-activations
+                pre_acts = F.linear(inputs, sae.encoder.weight, sae.encoder.bias)
+                acts = F.relu(pre_acts)  # (batch_size, d_sae)
+                
+                # Count activations above threshold
+                above_threshold = (acts > self.activation_threshold).sum(dim=0)  # (d_sae,)
+                self.feature_activation_counts[name] += above_threshold
+            
+            # Update total tokens processed
+            self.total_tokens_processed += batch_size * inputs.shape[1]  # batch_size * seq_len
+            
+            # Store inputs for L0 sparsity calculation
+            self.stored_inputs[name] = inputs.detach()
 
             if self.cfg.loss_fn in ("ce", "kl"):
                 # Replace the normal output with the SAE output
@@ -540,13 +575,26 @@ class Trainer:
                         info["kl_loss"] = avg_kl
 
                     for name in self.saes:
+                        # Original time-based dead feature detection
                         mask = (
                             self.num_tokens_since_fired[name]
                             > self.cfg.dead_feature_threshold
                         )
-
                         ratio = mask.mean(dtype=torch.float32).item()
                         info.update({f"dead_pct/{name}": ratio})
+                        
+                        # Dead feature percentage detection
+                        dead_feature_pct = self.calculate_dead_feature_percentage(name)
+                        info.update({f"dead_feature_pct/{name}": dead_feature_pct})
+                        
+                        # L0 Sparsity calculation
+                        if name in self.stored_inputs:
+                            l0_sparsity = self.calculate_l0_sparsity(name, self.stored_inputs[name])
+                            info.update({f"l0_sparsity/{name}": l0_sparsity})
+                        
+                        # Feature Absorption calculation
+                        feature_absorption = self.calculate_feature_absorption(name)
+                        info.update({f"feature_absorption/{name}": feature_absorption})
                         if self.cfg.loss_fn == "fvu":
                             info[f"fvu/{name}"] = avg_fvu[name]
 
@@ -580,6 +628,84 @@ class Trainer:
             self.save_best(avg_losses)
 
         pbar.close()
+
+    def calculate_dead_feature_percentage(self, name: str) -> float:
+        """
+        Calculate Dead Feature Percentage following the new methodology:
+        rate_j = #(z_j > τ) / (#tokens_in_val) with τ ≈ 1e-3
+        Mark latent dead if rate_j < 0.05%
+        """
+        if self.total_tokens_processed == 0:
+            return 0.0
+            
+        counts = self.feature_activation_counts[name]
+        
+        # Calculate activation rate per latent
+        activation_rates = counts.float() / self.total_tokens_processed  # (d_sae,)
+        
+        # Mark latent dead if rate_j < threshold
+        dead_mask = activation_rates < self.dead_percentage_threshold
+        
+        dead_percentage = dead_mask.float().mean().item() * 100
+        return dead_percentage
+
+    def calculate_l0_sparsity(self, name: str, inputs: torch.Tensor) -> float:
+        """
+        Calculate L0 Sparsity following SAEBench methodology
+        Uses actual model activations and counts non-zero features
+        """
+        # Get the SAE
+        sae = self.saes[name]
+        
+        # Forward pass through SAE to get activations
+        with torch.no_grad():
+            # Convert inputs to the same dtype as SAE weights
+            inputs = inputs.to(dtype=sae.encoder.weight.dtype)
+            
+            # Get pre-activations
+            pre_acts = F.linear(inputs, sae.encoder.weight, sae.encoder.bias)
+            
+            # Apply ReLU activation
+            acts = F.relu(pre_acts)
+            
+            # Count non-zero features per sample (L0 sparsity)
+            active_features = (acts > 0).sum(dim=1).float()
+            
+            # Return average L0 sparsity
+            return active_features.mean().item()
+    
+    def calculate_feature_absorption(self, name: str) -> float:
+        """
+        Calculate Feature Absorption following SAEBench methodology
+        Uses cosine similarity between decoder weights
+        """
+        # Get the SAE
+        sae = self.saes[name]
+        W_dec = sae.W_dec  # (d_sae, d_in)
+        
+        # For large SAEs, sample a subset of features to avoid memory issues
+        d_sae = W_dec.shape[0]
+        if d_sae > 10000:  # If more than 10k features, sample 10k
+            sample_size = 10000
+            indices = torch.randperm(d_sae, device=W_dec.device)[:sample_size]
+            W_dec = W_dec[indices]
+        
+        # Convert to numpy for sklearn cosine_similarity
+        decoder_weights = W_dec.detach().cpu().numpy()  # (d_sae, d_in)
+        
+        # Calculate cosine similarities between all pairs of features
+        similarities = cosine_similarity(decoder_weights)
+        
+        # Remove diagonal (self-similarity = 1.0)
+        np.fill_diagonal(similarities, 0)
+        
+        # Calculate absorption as mean of top similarities
+        # Following SAEBench: take top k similarities where k = min(100, similarities.shape[0])
+        k = min(100, similarities.shape[0])
+        top_similarities = np.partition(similarities.flatten(), -k)[-k:]
+        absorption = np.mean(top_similarities)
+        
+        return float(absorption)
 
     def local_hookpoints(self) -> list[str]:
         return (
