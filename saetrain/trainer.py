@@ -426,8 +426,11 @@ class Trainer:
             
             # Get the full activation tensor for this batch
             with torch.no_grad():
+                # Convert inputs to the same dtype as SAE weights
+                inputs_float = inputs.to(dtype=sae.encoder.weight.dtype)
+                
                 # Get pre-activations
-                pre_acts = F.linear(inputs, sae.encoder.weight, sae.encoder.bias)
+                pre_acts = F.linear(inputs_float, sae.encoder.weight, sae.encoder.bias)
                 acts = F.relu(pre_acts)  # (batch_size, d_sae)
                 
                 # Count activations above threshold
