@@ -82,8 +82,8 @@ class TrainConfig(Serializable):
     dead_feature_threshold: int = 10_000_000
     """Number of tokens after which a feature is considered dead."""
     
-    dead_percentage_threshold: float = 0.0005
-    """Dead feature percentage threshold (default: 0.05%). Features with activation rate below this are considered dead."""
+    dead_percentage_threshold: float = 0.1
+    """Dead feature percentage threshold (default: 0.1 = 10 percent). Features with activation rate below this fraction of expected baseline are considered dead."""
 
     hookpoints: list[str] = list_field()
     """List of hookpoints to train sparse coders on."""

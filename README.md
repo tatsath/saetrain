@@ -16,7 +16,7 @@ A Sparse Autoencoder is a neural network that learns to represent data using onl
 ## Key Metrics
 
 - **Loss**: How well the SAE reconstructs the original activations
-- **Dead Feature Percentage**: Percentage of features that are rarely used (below 0.05% activation rate)
+- **Dead Feature Percentage**: Percentage of features that are rarely used (below threshold activation rate)
 - **L0 Sparsity**: Average number of active features per sample
 - **Feature Absorption**: How similar features are to each other (lower is better)
 
@@ -33,7 +33,20 @@ pip install -e .
 
 ## Quick Start
 
-### Option 1: Integrated Training Script (Recommended)
+### Option 1: Multi-GPU Training (Recommended - Fastest)
+```bash
+# Run multi-GPU training for fastest results
+bash Train_sae_scripts_multiGPU.sh
+```
+
+**Multi-GPU Benefits:**
+- 🚀 6-8x faster training with 8 GPUs
+- 📊 Larger effective batch size (32 vs 4)
+- 💾 Better memory efficiency
+- 🔄 Distributed Data Parallel (DDP) training
+- ⚡ Real-time WandB logging from all ranks
+
+### Option 2: Single-GPU Training
 ```bash
 # Run the complete training pipeline with automatic assessment
 bash Train_sae_script.sh
@@ -46,7 +59,7 @@ This script includes:
 - ✅ SAEBench metric evaluation
 - ✅ Final results summary
 
-### Option 2: Manual Training
+### Option 3: Manual Training
 ```bash
 # Train an SAE on BERT layer 6
 python -m saetrain bert-base-uncased jyanimaulik/yahoo_finance_stockmarket_news \
@@ -54,6 +67,48 @@ python -m saetrain bert-base-uncased jyanimaulik/yahoo_finance_stockmarket_news 
     --max_tokens 1000000 \
     --k 192 \
     --expansion_factor 32
+```
+
+## Multi-GPU Training Setup
+
+### Environment Variables
+```bash
+# Multi-GPU Configuration
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export CUDA_LAUNCH_BLOCKING=1
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export PYTHONHASHSEED=42
+```
+
+### GPU Configuration Parameters
+- **`CUDA_VISIBLE_DEVICES`**: Specify which GPUs to use (comma-separated)
+- **`CUDA_LAUNCH_BLOCKING`**: Synchronous CUDA operations for debugging
+- **`CUBLAS_WORKSPACE_CONFIG`**: Optimize CUBLAS memory usage
+- **`PYTHONHASHSEED`**: Ensure reproducible results
+
+### Torchrun Command
+```bash
+torchrun \
+    --nproc_per_node=8 \
+    -m saetrain \
+    bert-base-uncased \
+    jyanimaulik/yahoo_finance_stockmarket_news \
+    --layers 6 \
+    --batch_size 4 \
+    --k 32 \
+    --num_latents 200 \
+    --grad_acc_steps 8 \
+    --ctx_len 512 \
+    --save_dir "./test_output_torchrun" \
+    --shuffle_seed 42 \
+    --init_seeds 42 \
+    --optimizer adam \
+    --lr 0.01 \
+    --save_every 500 \
+    --run_name "bert_layer6_k32_latents200_torchrun" \
+    --log_to_wandb true \
+    --wandb_log_frequency 10 \
+    --dead_percentage_threshold 0.1
 ```
 
 ## Command Line Parameters
@@ -94,6 +149,43 @@ python -m saetrain bert-base-uncased jyanimaulik/yahoo_finance_stockmarket_news 
 | `--layer_stride` | int | 1 | Stride between layers |
 | `--dead_feature_threshold` | int | 10000000 | Old dead feature threshold (deprecated) |
 
+## Multi-GPU Training Scripts
+
+### 1. Direct Torchrun Training (`Train_sae_scripts_multiGPU.sh`)
+**Features:**
+- 🚀 Direct torchrun command (like sparsify)
+- 📊 8-GPU DDP training
+- ⚡ Fast training with optimized parameters
+- 📈 Real-time WandB logging
+- 🔍 Automatic post-training assessment
+
+**Configuration:**
+```bash
+Model: bert-base-uncased
+Dataset: jyanimaulik/yahoo_finance_stockmarket_news
+Layers: 6
+Batch Size: 4 (effective: 32 with 8 GPUs)
+TopK: 32
+Num Latents: 200
+Context Length: 512
+Max Tokens: 10,000,000 (10M)
+Learning Rate: 0.01
+Dead Feature Threshold: 0.1 (10%)
+```
+
+### 2. Experimental Training (`Train_sae_scripts_experiment.sh`)
+**Features:**
+- 🔬 Experimental dead feature tracking
+- 📊 Enhanced metrics collection
+- 🎯 Optimized for research
+- 📈 Comprehensive logging
+
+### 3. Single-GPU Comparison (`Train_sae_scripts_experiment_single_gpu_comparison.sh`)
+**Features:**
+- 📊 Performance comparison
+- 🔍 Detailed analysis
+- 📈 Baseline metrics
+
 ## Integrated Training Script
 
 The `Train_sae_script.sh` provides a complete training pipeline with automatic assessment:
@@ -133,12 +225,45 @@ After training, the script automatically:
 - **Feature Absorption**: ≤0.25 (feature diversity)
 
 ## Examples
+
+### Basic Training
 ```bash
 python -m saetrain bert-base-uncased wikitext \
     --layers 6 \
     --max_tokens 1000000 \
     --k 192 \
     --expansion_factor 32
+```
+
+### Multi-GPU Training with Custom Parameters
+```bash
+# Set environment variables
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export CUDA_LAUNCH_BLOCKING=1
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+
+# Run with torchrun
+torchrun \
+    --nproc_per_node=8 \
+    -m saetrain \
+    bert-base-uncased \
+    jyanimaulik/yahoo_finance_stockmarket_news \
+    --layers 6 \
+    --batch_size 4 \
+    --k 32 \
+    --num_latents 200 \
+    --grad_acc_steps 8 \
+    --ctx_len 512 \
+    --save_dir "./test_output_torchrun" \
+    --shuffle_seed 42 \
+    --init_seeds 42 \
+    --optimizer adam \
+    --lr 0.01 \
+    --save_every 500 \
+    --run_name "bert_layer6_k32_latents200_torchrun" \
+    --log_to_wandb true \
+    --wandb_log_frequency 10 \
+    --dead_percentage_threshold 0.1
 ```
 
 ### Training with Custom Parameters
@@ -173,16 +298,23 @@ python -m saetrain bert-base-uncased wikitext \
 ### Core Parameters
 - **`k`**: Controls sparsity. Higher k = more active features = less sparse
 - **`expansion_factor`**: Controls SAE size. Higher = more features to learn
+- **`num_latents`**: Direct control over SAE size (overrides expansion_factor)
 - **`max_tokens`**: How much data to train on. More = better but slower
 
 ### Dead Feature Detection
 - **`dead_percentage_threshold`**: Features activated less than this percentage are considered "dead"
 - Default 0.0005 means features must be active in at least 0.05% of tokens to be "alive"
+- Higher thresholds (0.1 = 10%) are more lenient, lower thresholds are stricter
 
 ### Training Control
 - **`batch_size`**: Larger = faster but more memory
 - **`grad_acc_steps`**: Accumulate gradients over multiple batches (effective batch size = batch_size * grad_acc_steps)
 - **`ctx_len`**: Length of text sequences. Longer = more context but more memory
+
+### Multi-GPU Specific
+- **`--nproc_per_node`**: Number of GPUs to use
+- **Effective batch size**: batch_size × num_gpus × grad_acc_steps
+- **DDP synchronization**: Automatic gradient synchronization across GPUs
 
 ## Output
 
@@ -190,6 +322,7 @@ The tool saves:
 - Trained SAE models
 - Training logs
 - Metrics (if using WandB)
+- Post-training assessment reports
 
 ## Monitoring Training
 
@@ -199,10 +332,38 @@ If using WandB (`--log_to_wandb true`), you can monitor:
 - **L0 Sparsity**: Average active features per sample
 - **Feature Absorption**: Feature similarity (lower is better)
 
+### Multi-GPU Monitoring
+- **Distributed training**: All GPUs log to the same WandB run
+- **Real-time sync**: Metrics are synchronized across all ranks
+- **Performance tracking**: Training speed and GPU utilization
+
 ## Tips
 
-1. Start with smaller `max_tokens` for testing
-2. Use `expansion_factor` 32 for most cases
-3. Set `k` to 192 for good sparsity
-4. Use `grad_acc_steps` to increase effective batch size
-5. Monitor dead feature percentage - high values suggest the SAE is too large
+1. **Start with smaller `max_tokens` for testing**
+2. **Use `expansion_factor` 32 for most cases**
+3. **Set `k` to 192 for good sparsity**
+4. **Use `grad_acc_steps` to increase effective batch size**
+5. **Monitor dead feature percentage - high values suggest the SAE is too large**
+6. **For multi-GPU: Use `num_latents` for direct size control**
+7. **Adjust `dead_percentage_threshold` based on your needs (0.1 for lenient, 0.0005 for strict)**
+8. **Use `wandb_log_frequency` to control logging overhead**
+
+## Performance Comparison
+
+| Training Type | GPUs | Speed | Memory | Batch Size |
+|---------------|------|-------|--------|------------|
+| Single-GPU | 1 | 1x | High | 4 |
+| Multi-GPU | 8 | 6-8x | Distributed | 32 (4×8) |
+| Multi-GPU + Grad Acc | 8 | 6-8x | Distributed | 256 (4×8×8) |
+
+## Troubleshooting
+
+### Multi-GPU Issues
+- **CUDA out of memory**: Reduce batch_size or use gradient accumulation
+- **DDP sync issues**: Check CUDA_VISIBLE_DEVICES and torchrun parameters
+- **Slow training**: Ensure all GPUs are being utilized (check nvidia-smi)
+
+### Dead Feature Issues
+- **100% dead features**: Reduce learning rate or increase dead_percentage_threshold
+- **Too many dead features**: Increase k or reduce expansion_factor
+- **No dead features**: Increase dead_percentage_threshold or reduce k

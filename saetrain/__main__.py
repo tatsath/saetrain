@@ -199,6 +199,7 @@ def run():
             k_decay_steps=args.k_decay_steps,
             auxk_alpha=args.auxk_alpha,
             dead_feature_threshold=args.dead_feature_threshold,
+            dead_percentage_threshold=args.dead_percentage_threshold,
             hookpoints=args.hookpoints,
             init_seeds=args.init_seeds,
             layers=args.layers,

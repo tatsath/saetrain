@@ -701,10 +701,12 @@ class Trainer:
                         if self.cfg.sae.multi_topk:
                             info[f"multi_topk_fvu/{name}"] = avg_multi_topk_fvu[name]
 
-                    if self.cfg.distribute_modules:
+                    # Gather metrics from all ranks in multi-GPU mode
+                    if dist.is_initialized() and dist.get_world_size() > 1:
                         outputs = [{} for _ in range(dist.get_world_size())]
                         dist.gather_object(info, outputs if rank_zero else None)
-                        info.update({k: v for out in outputs for k, v in out.items()})
+                        if rank_zero:
+                            info.update({k: v for out in outputs for k, v in out.items()})
 
                     if rank_zero:
                         info["k"] = k
@@ -757,69 +759,53 @@ class Trainer:
 
     def calculate_dead_feature_percentage_robust(self, name: str) -> float:
         """
-        Robust dead feature detection using multiple signals:
-        1. Fire-count vs expected baseline (Wilson lower bound)
-        2. Mass ranking (bottom tail)
-        3. Decoder row norm check
+        Adaptive dead feature detection based on model parameters (K, N, tokens).
+        
+        A feature is dead if it fires significantly less than its "fair share" 
+        based on the model's sparsity pattern (K active features out of N total).
         """
         if self.total_tokens_processed == 0:
             return 0.0
             
         counts = self.feature_activation_counts[name]
-        sae = self.saes[name]
-        
-        # Calculate activation rate per latent
-        activation_rates = counts.float() / self.total_tokens_processed  # (d_sae,)
-        
-        # Get mass accumulation for ranking
-        mass_accumulator = self.feature_mass_accumulator[name]
-        
-        # Get current k value and number of features
-        current_k = self.get_current_k()
         num_features = counts.shape[0]
-        expected_baseline = current_k / num_features
         
-        # Signal 1: Wilson lower bound for fire-rate
-        # Mark dead if Wilson lower bound is below expected baseline
-        dead_features = 0
+        # Gather counts from all ranks in multi-GPU mode
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            # Gather counts from all ranks
+            gathered_counts = [torch.zeros_like(counts) for _ in range(dist.get_world_size())]
+            dist.all_gather(gathered_counts, counts)
+            
+            # Sum counts from all ranks
+            total_counts = torch.zeros_like(counts)
+            for rank_counts in gathered_counts:
+                total_counts += rank_counts
+            
+            counts = total_counts
         
-        # Signal 2: Mass ranking - find bottom tail
-        if mass_accumulator.numel() > 0:
-            # Get bottom 10% by mass
-            mass_ranks = torch.argsort(mass_accumulator)
-            bottom_tail_size = max(1, int(num_features * 0.1))  # Bottom 10%
-            bottom_mass_indices = mass_ranks[:bottom_tail_size]
+        # Get current K value (number of active features per token)
+        current_k = self.get_current_k()
+        
+        # Expected "fair share" of activations per feature
+        # If K features are active per token, each feature should get ~K/N of the activations
+        expected_activation_rate = current_k / num_features
+        
+        # Adaptive threshold: a feature is dead if it fires less than the configured percentage of its expected rate
+        # This accounts for the fact that some features will naturally be used more than others
+        adaptive_threshold_rate = expected_activation_rate * self.cfg.dead_percentage_threshold
+        
+        # Calculate threshold count based on adaptive rate
+        threshold_count = self.total_tokens_processed * adaptive_threshold_rate
+        
+        # Special case for α = 0 (Anthropic strict rule): only features that never fire are dead
+        if self.cfg.dead_percentage_threshold == 0.0:
+            dead_features = (counts == 0).sum().item()
         else:
-            bottom_mass_indices = set()
-        
-        for i in range(num_features):
-            n = self.total_tokens_processed
-            p_hat = activation_rates[i].item()
-            
-            # Wilson lower bound
-            if n > 0 and p_hat > 0:
-                z = 1.96  # 95% confidence
-                denominator = 1 + z**2/n
-                centre_adjusted_probability = (p_hat + z*z/(2*n))/denominator
-                adjusted_standard_error = z * torch.sqrt(torch.tensor((p_hat * (1 - p_hat) + z*z/(4*n))/n)) / denominator
-                lower_bound = centre_adjusted_probability - adjusted_standard_error
-            else:
-                lower_bound = 0.0
-            
-            # Signal 2: Check if feature is in bottom mass rank
-            is_bottom_mass = i in bottom_mass_indices
-            
-            # Signal 3: Check decoder row norm (if available)
-            decoder_dead = False
-            if hasattr(sae, 'decoder') and hasattr(sae.decoder, 'weight'):
-                row_norm = torch.norm(sae.decoder.weight[i], p=2).item()
-                decoder_dead = row_norm < 1e-8  # Numerically zero
-            
-            # Feature is dead if it fails multiple signals
-            if (lower_bound < expected_baseline * 0.5 and is_bottom_mass) or decoder_dead:
-                dead_features += 1
+            # Count features that fired less than threshold_count times
+            dead_features = (counts < threshold_count).sum().item()
         
         dead_percentage = (dead_features / num_features) * 100
+        
         return dead_percentage
 
     def calculate_l0_sparsity(self, name: str, inputs: torch.Tensor) -> float:
