@@ -67,8 +67,16 @@ class Trainer:
         # Initialize dead feature percentage tracking
         self.feature_activation_counts = {}
         self.total_tokens_processed = 0
-        self.activation_threshold = 1e-3  # τ ≈ 1e-3 (fixed)
-        self.dead_percentage_threshold = getattr(cfg, 'dead_percentage_threshold', 0.0005)  # 0.05%
+        # Adaptive threshold system for robust dead feature detection
+        self.use_adaptive_threshold = getattr(cfg, 'use_adaptive_threshold', True)
+        self.activation_threshold = getattr(cfg, 'activation_threshold', 1e-5)  # Fallback threshold
+        
+        # For adaptive thresholds
+        self.activation_history = {}
+        self.adaptive_thresholds = {}
+        
+        # For robust dead feature detection
+        self.feature_mass_accumulator = {}
         
         # Store inputs for L0 sparsity calculation
         self.stored_inputs = {}
@@ -100,6 +108,7 @@ class Trainer:
                 # Initialize dead feature percentage tracking for this SAE
                 d_sae = self.saes[name].num_latents
                 self.feature_activation_counts[name] = torch.zeros(d_sae, device=device)
+                self.feature_mass_accumulator[name] = torch.zeros(d_sae, device=device)
 
         assert isinstance(dataset, Sized)
         num_batches = len(dataset) // cfg.batch_size
@@ -440,9 +449,40 @@ class Trainer:
                 pre_acts = F.linear(inputs_float, sae.encoder.weight, sae.encoder.bias)
                 acts = F.relu(pre_acts)  # (batch_size, d_sae)
                 
-                # Count activations above threshold
-                above_threshold = (acts > self.activation_threshold).sum(dim=0)  # (d_sae,)
+                # Use adaptive threshold for activation counting
+                if self.use_adaptive_threshold:
+                    # Calculate adaptive threshold based on current activations
+                    adaptive_threshold = self.calculate_adaptive_threshold(name, acts)
+                    self.adaptive_thresholds[name] = adaptive_threshold
+                    
+                    # Debug logging (print every 1000 steps)
+                    if not hasattr(self, 'debug_step'):
+                        self.debug_step = 0
+                    self.debug_step += 1
+                    
+                    # Debug output removed to avoid interfering with progress bar
+                    # if self.debug_step % 1000 == 0:
+                    #     max_activation = acts.max().item()
+                    #     min_activation = acts.min().item()
+                    #     mean_activation = acts.mean().item()
+                    #     non_zero_count = (acts > 0).sum().item()
+                    #     total_elements = acts.numel()
+                    #     print(f"Debug Step {self.debug_step}:")
+                    #     print(f"  Adaptive threshold: {adaptive_threshold:.8f}")
+                    #     print(f"  Max activation: {max_activation:.8f}")
+                    #     print(f"  Min activation: {min_activation:.8f}")
+                    #     print(f"  Mean activation: {mean_activation:.8f}")
+                    #     print(f"  Non-zero activations: {non_zero_count}/{total_elements}")
+                else:
+                    adaptive_threshold = self.activation_threshold
+                
+                # Count activations above adaptive threshold
+                above_threshold = (acts > adaptive_threshold).sum(dim=0)  # (d_sae,)
                 self.feature_activation_counts[name] += above_threshold
+                
+                # Accumulate mass (sum of activations) for each feature
+                feature_mass = acts.sum(dim=0)  # (d_sae,)
+                self.feature_mass_accumulator[name] += feature_mass
             
             # Update total tokens processed
             self.total_tokens_processed += batch_size * inputs.shape[1]  # batch_size * seq_len
@@ -642,7 +682,7 @@ class Trainer:
                         info.update({f"dead_pct/{name}": ratio})
                         
                         # Dead feature percentage detection
-                        dead_feature_pct = self.calculate_dead_feature_percentage(name)
+                        dead_feature_pct = self.calculate_dead_feature_percentage_robust(name)
                         info.update({f"dead_feature_pct/{name}": dead_feature_pct})
                         
                         # L0 Sparsity calculation
@@ -689,24 +729,97 @@ class Trainer:
 
         pbar.close()
 
-    def calculate_dead_feature_percentage(self, name: str) -> float:
+    def calculate_adaptive_threshold(self, name: str, acts: torch.Tensor) -> float:
         """
-        Calculate Dead Feature Percentage following the new methodology:
-        rate_j = #(z_j > τ) / (#tokens_in_val) with τ ≈ 1e-3
-        Mark latent dead if rate_j < 0.05%
+        Calculate adaptive activation threshold using robust methodology:
+        - Per-layer percentiles on non-zeros only
+        - Wilson lower bound for fire-rate vs expected baseline
+        - Mass ranking to identify truly dead features
+        """
+        if acts.numel() == 0:
+            return self.activation_threshold
+            
+        # Use 50th percentile (median) of non-zero activations as threshold
+        # This ensures we capture the top 50% of meaningful activations
+        acts_flat = acts.flatten()
+        non_zero_acts = acts_flat[acts_flat > 0]
+        
+        if non_zero_acts.numel() == 0:
+            return self.activation_threshold
+            
+        # Use median of non-zero activations (more robust than mean)
+        threshold = torch.median(non_zero_acts).item()
+         
+        # Ensure minimum threshold to avoid numerical issues
+        threshold = max(threshold, 1e-8)
+        
+        return threshold
+
+    def calculate_dead_feature_percentage_robust(self, name: str) -> float:
+        """
+        Robust dead feature detection using multiple signals:
+        1. Fire-count vs expected baseline (Wilson lower bound)
+        2. Mass ranking (bottom tail)
+        3. Decoder row norm check
         """
         if self.total_tokens_processed == 0:
             return 0.0
             
         counts = self.feature_activation_counts[name]
+        sae = self.saes[name]
         
         # Calculate activation rate per latent
         activation_rates = counts.float() / self.total_tokens_processed  # (d_sae,)
         
-        # Mark latent dead if rate_j < threshold
-        dead_mask = activation_rates < self.dead_percentage_threshold
+        # Get mass accumulation for ranking
+        mass_accumulator = self.feature_mass_accumulator[name]
         
-        dead_percentage = dead_mask.float().mean().item() * 100
+        # Get current k value and number of features
+        current_k = self.get_current_k()
+        num_features = counts.shape[0]
+        expected_baseline = current_k / num_features
+        
+        # Signal 1: Wilson lower bound for fire-rate
+        # Mark dead if Wilson lower bound is below expected baseline
+        dead_features = 0
+        
+        # Signal 2: Mass ranking - find bottom tail
+        if mass_accumulator.numel() > 0:
+            # Get bottom 10% by mass
+            mass_ranks = torch.argsort(mass_accumulator)
+            bottom_tail_size = max(1, int(num_features * 0.1))  # Bottom 10%
+            bottom_mass_indices = mass_ranks[:bottom_tail_size]
+        else:
+            bottom_mass_indices = set()
+        
+        for i in range(num_features):
+            n = self.total_tokens_processed
+            p_hat = activation_rates[i].item()
+            
+            # Wilson lower bound
+            if n > 0 and p_hat > 0:
+                z = 1.96  # 95% confidence
+                denominator = 1 + z**2/n
+                centre_adjusted_probability = (p_hat + z*z/(2*n))/denominator
+                adjusted_standard_error = z * torch.sqrt(torch.tensor((p_hat * (1 - p_hat) + z*z/(4*n))/n)) / denominator
+                lower_bound = centre_adjusted_probability - adjusted_standard_error
+            else:
+                lower_bound = 0.0
+            
+            # Signal 2: Check if feature is in bottom mass rank
+            is_bottom_mass = i in bottom_mass_indices
+            
+            # Signal 3: Check decoder row norm (if available)
+            decoder_dead = False
+            if hasattr(sae, 'decoder') and hasattr(sae.decoder, 'weight'):
+                row_norm = torch.norm(sae.decoder.weight[i], p=2).item()
+                decoder_dead = row_norm < 1e-8  # Numerically zero
+            
+            # Feature is dead if it fails multiple signals
+            if (lower_bound < expected_baseline * 0.5 and is_bottom_mass) or decoder_dead:
+                dead_features += 1
+        
+        dead_percentage = (dead_features / num_features) * 100
         return dead_percentage
 
     def calculate_l0_sparsity(self, name: str, inputs: torch.Tensor) -> float:
