@@ -280,7 +280,15 @@ class Trainer:
         print(f"Number of SAE parameters: {num_sae_params:_}")
         print(f"Number of model parameters: {num_model_params:_}")
 
-        num_batches = len(self.dataset) // self.cfg.batch_size
+        # Calculate total batches for progress bar (estimate based on max_tokens)
+        if self.cfg.max_tokens is not None:
+            # Estimate total batches based on max_tokens
+            tokens_per_batch = self.cfg.batch_size * self.cfg.ctx_len if hasattr(self.cfg, 'ctx_len') else self.cfg.batch_size * 512
+            estimated_total_batches = self.cfg.max_tokens // tokens_per_batch
+            num_batches = estimated_total_batches
+        else:
+            num_batches = len(self.dataset) // self.cfg.batch_size
+
         if self.global_step > 0:
             assert hasattr(self.dataset, "select"), "Dataset must implement `select`"
 
@@ -468,7 +476,54 @@ class Trainer:
         for name, sae in self.saes.items():
             sae.cfg.k = k
 
-        for batch in dl:
+        # SAE-Lens style training loop with dataset repetition
+        dataset_iter = iter(dl)
+        dataset_exhausted = False
+        dataset_repetitions = 0
+        
+        # Calculate total tokens in dataset for logging
+        if hasattr(self.cfg, 'ctx_len'):
+            tokens_per_example = self.cfg.ctx_len
+        else:
+            # Estimate based on typical context length
+            tokens_per_example = 512
+        
+        total_dataset_tokens = len(self.dataset) * tokens_per_example
+        
+        if rank_zero and self.cfg.max_tokens is not None:
+            print(f"Dataset contains ~{total_dataset_tokens:,} tokens")
+            print(f"Target: {self.cfg.max_tokens:,} tokens")
+            if total_dataset_tokens < self.cfg.max_tokens:
+                estimated_repetitions = self.cfg.max_tokens // total_dataset_tokens
+                print(f"Dataset will be repeated ~{estimated_repetitions} times to reach target")
+            else:
+                print("Dataset is large enough, no repetition needed")
+        
+        max_repetitions = 1000  # Safety limit to prevent infinite loops
+        while True:
+            try:
+                batch = next(dataset_iter)
+            except StopIteration:
+                # Dataset exhausted, restart from beginning
+                if self.cfg.max_tokens is not None and total_tokens_processed < self.cfg.max_tokens:
+                    dataset_repetitions += 1
+                    
+                    # Safety check to prevent infinite loops
+                    if dataset_repetitions > max_repetitions:
+                        if rank_zero:
+                            print(f"\n⚠️ Safety limit reached: {max_repetitions} dataset repetitions. Stopping training.")
+                        break
+                    
+                    if rank_zero:
+                        print(f"\nDataset exhausted after {total_tokens_processed:,} tokens. Restarting dataset... (Repetition #{dataset_repetitions})")
+                    dataset_iter = iter(dl)  # Restart dataset iterator
+                    batch = next(dataset_iter)
+                else:
+                    # No max_tokens limit or limit reached, exit
+                    if rank_zero and dataset_repetitions > 0:
+                        print(f"\nTraining completed with {dataset_repetitions} dataset repetitions")
+                    break
+            
             x = batch["input_ids"].to(device)
 
             if not maybe_wrapped:
@@ -491,7 +546,8 @@ class Trainer:
             
             # Check if we've reached the max_tokens limit
             if self.cfg.max_tokens is not None and total_tokens_processed >= self.cfg.max_tokens:
-                print(f"\nReached max_tokens limit: {total_tokens_processed:,} >= {self.cfg.max_tokens:,}")
+                if rank_zero:
+                    print(f"\nReached max_tokens limit: {total_tokens_processed:,} >= {self.cfg.max_tokens:,}")
                 break
 
             # Compute clean logits if using KL loss
@@ -612,6 +668,8 @@ class Trainer:
 
                     if rank_zero:
                         info["k"] = k
+                        info["dataset_repetitions"] = dataset_repetitions
+                        info["total_tokens_processed"] = total_tokens_processed
 
                         if wandb is not None:
                             wandb.log(info, step=step)

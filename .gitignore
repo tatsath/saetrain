@@ -109,6 +109,12 @@ saetrain.egg-info/
 !README.md
 !LICENSE
 
+# Use Case folders to ignore
+tutorials/
+UseCase_BERTvsFinBERT/
+UseCase_FinancialReasoning/
+UseCase_Trading/
+
 # Test files to ignore
 test_*.py
 *_test.py
