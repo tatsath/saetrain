@@ -156,18 +156,20 @@ def load_sae_checkpoint(checkpoint_path: str, device: torch.device) -> Tuple[Dic
         for expected_key, actual_name in weight_mapping.items():
             weights[expected_key] = f.get_tensor(actual_name).to(device)
             print(f"   {expected_key}: {actual_name} -> {weights[expected_key].shape}")
+        
+        # Handle the case where tensor names don't match expected keys
+        if 'W_enc' not in weights and 'encoder.weight' in weights:
+            weights['W_enc'] = weights['encoder.weight']
+        if 'b_enc' not in weights and 'encoder.bias' in weights:
+            weights['b_enc'] = weights['encoder.bias']
     
-    # Calculate d_sae from expansion factor if not present
-    if 'd_sae' not in config and 'expansion_factor' in config:
-        config['d_sae'] = config['d_in'] * config['expansion_factor']
-    elif 'd_sae' not in config:
-        # Fallback: calculate from weights
-        config['d_sae'] = weights['W_enc'].shape[0]
+    # Calculate d_sae from weights (actual SAE size)
+    config['d_sae'] = weights['W_enc'].shape[0]
     
     print(f"✅ SAE loaded successfully")
     print(f"   Input dimension (d_in): {config['d_in']}")
     print(f"   SAE dimension (d_sae): {config['d_sae']}")
-    print(f"   Expansion factor: {config['d_sae'] / config['d_in']:.1f}")
+    print(f"   Expansion factor: {config['d_sae'] / config['d_in']:.1f}x")
     
     return config, weights
 
@@ -360,6 +362,13 @@ def extract_model_activations(model, tokens: torch.Tensor, layer: int,
     with torch.no_grad():
         for i in tqdm(range(0, tokens.shape[0], batch_size), desc="Extracting activations", disable=not verbose):
             batch_tokens = tokens[i:i + batch_size]
+            # Ensure batch_tokens is on the same device as the model
+            if hasattr(model, 'device'):
+                batch_tokens = batch_tokens.to(model.device)
+            else:
+                # For distributed models, try to get the device of the first parameter
+                first_param = next(model.parameters())
+                batch_tokens = batch_tokens.to(first_param.device)
             
             # Get activations using hooks
             activations = None
@@ -409,22 +418,23 @@ def extract_model_activations(model, tokens: torch.Tensor, layer: int,
     print(f"✅ Extracted activations shape: {all_activations.shape}")
     return all_activations
 
-def encode_sae(activations: torch.Tensor, weights: Dict) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def encode_sae(activations: torch.Tensor, weights: Dict, config: Dict) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Encode activations using the SAE (following Sparsify's approach)"""
-    W_enc = weights["W_enc"]  # Shape: (d_sae, d_in) - already transposed
+    W_enc = weights["W_enc"]  # Shape: (d_sae, d_in) 
     b_enc = weights["b_enc"]  # (d_sae,)
     
     # Apply encoder: activations @ W_enc + b_enc
     # activations: (batch_size, d_in)
-    # W_enc: (d_sae, d_in) - already in correct format for F.linear
+    # W_enc: (d_sae, d_in) 
     # Result: (batch_size, d_sae)
-    pre_acts = F.linear(activations, W_enc, b_enc)  # W_enc is already (d_sae, d_in)
+    pre_acts = F.linear(activations, W_enc, b_enc)  # W_enc is (d_sae, d_in)
     
     # Apply ReLU activation
     acts = F.relu(pre_acts)
     
     # Get top-k activations (following Sparsify's TopK approach)
-    k = min(200, acts.shape[1])  # Use k=200 or all features if fewer
+    # Use k from config if available, otherwise use a reasonable default
+    k = config.get('k', min(64, acts.shape[1]))  # Use config k or reasonable default
     top_acts, top_indices = acts.topk(k, dim=1, sorted=False)
     
     return top_acts, top_indices, pre_acts
@@ -452,7 +462,7 @@ def decode_sae(top_acts: torch.Tensor, top_indices: torch.Tensor, weights: Dict)
     
     return decoded
 
-def calculate_fvu_saebench(activations: torch.Tensor, weights: Dict, verbose: bool = False) -> float:
+def calculate_fvu_saebench(activations: torch.Tensor, weights: Dict, config: Dict, verbose: bool = False) -> float:
     """
     Calculate FVU (Fraction of Variance Unexplained) following SAEBench methodology
     Uses actual model activations and proper FVU calculation
@@ -464,7 +474,7 @@ def calculate_fvu_saebench(activations: torch.Tensor, weights: Dict, verbose: bo
         print(f"🔍 FVU Debug - Input activations std: {activations.std():.4f}")
     
     # Encode and decode
-    top_acts, top_indices, pre_acts = encode_sae(activations, weights)
+    top_acts, top_indices, pre_acts = encode_sae(activations, weights, config)
     
     if verbose:
         print(f"🔍 FVU Debug - Pre-acts shape: {pre_acts.shape}")
@@ -509,13 +519,13 @@ def calculate_fvu_saebench(activations: torch.Tensor, weights: Dict, verbose: bo
     
     return max(0.0, min(100.0, loss_recovered))
 
-def calculate_l0_sparsity_saebench(activations: torch.Tensor, weights: Dict) -> float:
+def calculate_l0_sparsity_saebench(activations: torch.Tensor, weights: Dict, config: Dict) -> float:
     """
     Calculate L0 Sparsity following SAEBench methodology
     Uses actual model activations and counts non-zero features
     """
     # Encode to get activations
-    _, _, pre_acts = encode_sae(activations, weights)
+    _, _, pre_acts = encode_sae(activations, weights, config)
     acts = F.relu(pre_acts)
     
     # Count non-zero features per sample (L0 sparsity)
@@ -524,14 +534,14 @@ def calculate_l0_sparsity_saebench(activations: torch.Tensor, weights: Dict) -> 
     # Return average L0 sparsity
     return active_features.mean().item()
 
-def calculate_dead_features_saebench(activations: torch.Tensor, weights: Dict, verbose: bool = False, 
+def calculate_dead_features_saebench(activations: torch.Tensor, weights: Dict, config: Dict, verbose: bool = False, 
                                    min_activations: int = 5, activation_threshold: float = 0.1) -> float:
     """
     Calculate dead features following improved methodology
     Features that are rarely activated (less than min_activations times) or have very low activation strength
     """
     # Encode to get activations
-    _, _, pre_acts = encode_sae(activations, weights)
+    _, _, pre_acts = encode_sae(activations, weights, config)
     acts = F.relu(pre_acts)
     
     if verbose:
@@ -645,14 +655,14 @@ def evaluate_sae_health_real_activations(sae_path: str, model_name: str, layer: 
     print("📈 Calculating Metrics (SAEBench methodology with real activations)...")
     
     # 1. Loss Recovered / FVU
-    loss_recovered = calculate_fvu_saebench(activations, weights, verbose)
+    loss_recovered = calculate_fvu_saebench(activations, weights, config, verbose)
     
     # 2. L0 Sparsity
-    l0_sparsity = calculate_l0_sparsity_saebench(activations, weights)
+    l0_sparsity = calculate_l0_sparsity_saebench(activations, weights, config)
     
     # 3. Dead Features %
     dead_features = calculate_dead_features_saebench(
-        activations, weights, verbose, 
+        activations, weights, config, verbose, 
         min_activations=min_activations, 
         activation_threshold=activation_threshold
     )
