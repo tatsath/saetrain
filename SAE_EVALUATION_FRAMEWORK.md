@@ -4,25 +4,12 @@
 
 This document provides a comprehensive framework for evaluating Sparse Autoencoders (SAEs) across different domains, model architectures, and datasets. It covers theoretical foundations, evaluation metrics, domain-specific considerations, and practical implementation guidelines.
 
-## 🎯 Theoretical Foundations
-
-### What are Sparse Autoencoders?
-
-Sparse Autoencoders are neural networks designed to learn sparse, interpretable representations of model activations. They consist of:
-
-1. **Encoder**: Compresses activations to sparse latent representations
-2. **Decoder**: Reconstructs original activations from sparse latents
-3. **Sparsity Constraint**: Ensures only a small subset of features are active
-
-### Why Evaluate SAEs?
+## Why Evaluate SAEs?
 
 SAE evaluation serves multiple critical purposes:
 
-1. **Interpretability**: Assess whether learned features are meaningful and interpretable
-2. **Reconstruction Quality**: Measure how well the SAE preserves information
-3. **Sparsity Validation**: Ensure the SAE maintains desired sparsity properties
-4. **Generalization**: Test performance across different domains and tasks
-5. **Training Health**: Identify and diagnose training issues
+1. **Reconstruction Quality**: Measure how well the SAE preserves information
+2. **Sparsity Validation**: Ensure the SAE maintains desired sparsity properties
 
 ## 📊 Core Evaluation Metrics
 
