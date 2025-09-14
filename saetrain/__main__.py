@@ -126,6 +126,7 @@ def load_artifacts(
                 max_seq_len=args.ctx_len,
                 num_proc=args.data_preprocessing_num_proc,
                 text_key=args.text_column,
+                dataset_name=args.dataset,  # Pass dataset name for intelligent detection
             )
         else:
             print("Dataset already tokenized; skipping tokenization.")
